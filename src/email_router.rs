@@ -93,7 +93,15 @@ impl EmailRouter {
         let mut send_positive_review = false;
         let mut cc = Vec::new();
 
+        let has_non_wide = active_policies.iter().any(|p| !p.wide_list);
+
         for p in active_policies {
+            if p.wide_list && has_non_wide {
+                for cr in &p.cc {
+                    cc.push(cr.clone());
+                }
+                continue;
+            }
             if p.mute_all {
                 mute_all = true;
             }
@@ -388,6 +396,56 @@ mod tests {
                 assert!(!cc.contains(&"bot@sashiko.dev".to_string()));
             }
             Action::Mute => panic!("Should not mute"),
+        }
+    }
+
+    #[test]
+    fn test_wide_list_precedence() {
+        let mut subsystems = HashMap::new();
+        // Wide list policy has reply_all = false, but wide_list = true
+        subsystems.insert(
+            "rust-for-linux".to_string(),
+            SubsystemPolicy {
+                lists: vec!["rust-for-linux@vger.kernel.org".to_string()],
+                reply_all: false,
+                wide_list: true,
+                ..Default::default()
+            },
+        );
+        // Subsystem-specific list has reply_all = true, wide_list = false
+        subsystems.insert(
+            "nova-gpu".to_string(),
+            SubsystemPolicy {
+                lists: vec!["nova-gpu@lists.freedesktop.org".to_string()],
+                reply_all: true,
+                wide_list: false,
+                ..Default::default()
+            },
+        );
+        let policy = EmailPolicyConfig {
+            defaults: Default::default(),
+            subsystems,
+        };
+
+        // Resolving recipients when both matched should NOT private-downgrade, i.e., reply_all should be true (is_private = false)
+        let action = EmailRouter::resolve_recipients(
+            &policy,
+            &[
+                "rust-for-linux@vger.kernel.org".to_string(),
+                "nova-gpu@lists.freedesktop.org".to_string(),
+            ],
+            &[],
+            "author@test.com",
+            "bot@sashiko.dev",
+        );
+
+        match action {
+            Action::Send { to, .. } => {
+                // Since reply_all is true (is_private = false), the mailing lists must remain in the "to" field!
+                assert!(to.contains(&"rust-for-linux@vger.kernel.org".to_string()));
+                assert!(to.contains(&"nova-gpu@lists.freedesktop.org".to_string()));
+            }
+            _ => panic!("Expected Action::Send"),
         }
     }
 }
