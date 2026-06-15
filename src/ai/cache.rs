@@ -129,34 +129,51 @@ impl AiProvider for CachingAiProvider {
             let tokens_saved: i64 = row.get(1)?;
             let created_at: i64 = row.get(2)?;
             if let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json) {
-                let (origin, total) = if created_at >= self.session_start {
-                    self.hits_this.fetch_add(1, Ordering::Relaxed);
-                    let t = self
-                        .tokens_saved_this
-                        .fetch_add(tokens_saved as u64, Ordering::Relaxed)
-                        + tokens_saved as u64;
-                    ("this session", t)
+                let has_content = resp.content.as_ref().map_or(false, |c| !c.trim().is_empty());
+                let has_tool_calls = resp.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty());
+
+                if has_content || has_tool_calls {
+                    let (origin, total) = if created_at >= self.session_start {
+                        self.hits_this.fetch_add(1, Ordering::Relaxed);
+                        let t = self
+                            .tokens_saved_this
+                            .fetch_add(tokens_saved as u64, Ordering::Relaxed)
+                            + tokens_saved as u64;
+                        ("this session", t)
+                    } else {
+                        self.hits_prev.fetch_add(1, Ordering::Relaxed);
+                        let t = self
+                            .tokens_saved_prev
+                            .fetch_add(tokens_saved as u64, Ordering::Relaxed)
+                            + tokens_saved as u64;
+                        ("previous session", t)
+                    };
+                    info!(
+                        "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
+                        hash_prefix,
+                        origin,
+                        fmt_thousands(tokens_saved as u64),
+                        origin,
+                        fmt_thousands(total)
+                    );
+                    if let Some(ref mut usage) = resp.usage {
+                        usage.cached_tokens =
+                            Some(usage.cached_tokens.unwrap_or(0) + usage.prompt_tokens);
+                    }
+                    return Ok(resp);
                 } else {
-                    self.hits_prev.fetch_add(1, Ordering::Relaxed);
-                    let t = self
-                        .tokens_saved_prev
-                        .fetch_add(tokens_saved as u64, Ordering::Relaxed)
-                        + tokens_saved as u64;
-                    ("previous session", t)
-                };
-                info!(
-                    "Cache hit [{}] ({}) — {} tokens saved (total {}: {})",
-                    hash_prefix,
-                    origin,
-                    fmt_thousands(tokens_saved as u64),
-                    origin,
-                    fmt_thousands(total)
-                );
-                if let Some(ref mut usage) = resp.usage {
-                    usage.cached_tokens =
-                        Some(usage.cached_tokens.unwrap_or(0) + usage.prompt_tokens);
+                    tracing::warn!(
+                        "Found empty/invalid response in cache [{}], deleting and falling back to provider",
+                        hash_prefix
+                    );
+                    let _ = self
+                        .conn
+                        .execute(
+                            "DELETE FROM response_cache WHERE request_hash = ?",
+                            libsql::params![hash.clone()],
+                        )
+                        .await;
                 }
-                return Ok(resp);
             }
         }
 
@@ -164,34 +181,41 @@ impl AiProvider for CachingAiProvider {
 
         let resp = self.inner.generate_content(request.clone()).await?;
 
-        let response_json = serde_json::to_string(&resp)?;
-        let request_json = serde_json::to_string(&request)?;
-        let caps = self.inner.get_capabilities();
-        let tokens_saved = resp
-            .usage
-            .as_ref()
-            .map(|u| u.prompt_tokens + u.completion_tokens)
-            .unwrap_or(0);
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs() as i64;
+        let has_content = resp.content.as_ref().map_or(false, |c| !c.trim().is_empty());
+        let has_tool_calls = resp.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty());
 
-        let _ = self
-            .conn
-            .execute(
-                "INSERT OR REPLACE INTO response_cache (request_hash, provider, model, request_json, response_json, tokens_saved, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                libsql::params![
-                    hash,
-                    caps.model_name.clone(),
-                    caps.model_name,
-                    request_json,
-                    response_json,
-                    tokens_saved as i64,
-                    now
-                ],
-            )
-            .await;
+        if has_content || has_tool_calls {
+            let response_json = serde_json::to_string(&resp)?;
+            let request_json = serde_json::to_string(&request)?;
+            let caps = self.inner.get_capabilities();
+            let tokens_saved = resp
+                .usage
+                .as_ref()
+                .map(|u| u.prompt_tokens + u.completion_tokens)
+                .unwrap_or(0);
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs() as i64;
+
+            let _ = self
+                .conn
+                .execute(
+                    "INSERT OR REPLACE INTO response_cache (request_hash, provider, model, request_json, response_json, tokens_saved, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    libsql::params![
+                        hash,
+                        caps.model_name.clone(),
+                        caps.model_name,
+                        request_json,
+                        response_json,
+                        tokens_saved as i64,
+                        now
+                    ],
+                )
+                .await;
+        } else {
+            debug!("Skipping cache insertion for empty AI response [{}]", hash_prefix);
+        }
 
         Ok(resp)
     }
@@ -213,3 +237,95 @@ impl AiProvider for CachingAiProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiMessage, AiRole};
+    use tempfile::tempdir;
+
+    struct EmptyResponseProvider {
+        call_count: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiProvider for EmptyResponseProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let count = self.call_count.fetch_add(1, Ordering::SeqCst);
+            if count == 0 {
+                // Return empty response on first call
+                Ok(AiResponse {
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            } else {
+                // Return non-empty response on second call
+                Ok(AiResponse {
+                    content: Some("success".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+        }
+
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "empty-mock".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_empty_ai_response_not_cached() -> Result<()> {
+        let temp_dir = tempdir()?;
+        let cache_db = temp_dir.path().join("test_cache.db");
+        let cache_path = cache_db.to_string_lossy().to_string();
+
+        let inner = Arc::new(EmptyResponseProvider {
+            call_count: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let caching_provider = CachingAiProvider::new(inner.clone(), &cache_path, 1).await?;
+
+        let req = AiRequest {
+            system: None,
+            messages: vec![AiMessage {
+                role: AiRole::User,
+                content: Some("hello".to_string()),
+                thought: None,
+                thought_signature: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        // First call should return the empty response
+        let resp1 = caching_provider.generate_content(req.clone()).await?;
+        assert!(resp1.content.is_none());
+        assert_eq!(inner.call_count.load(Ordering::SeqCst), 1);
+
+        // Second call should miss the cache (since empty was not cached) and call inner again
+        let resp2 = caching_provider.generate_content(req.clone()).await?;
+        assert_eq!(resp2.content.as_deref(), Some("success"));
+        assert_eq!(inner.call_count.load(Ordering::SeqCst), 2);
+
+        Ok(())
+    }
+}
+

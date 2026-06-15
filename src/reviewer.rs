@@ -915,8 +915,21 @@ impl Reviewer {
                 if applied {
                     if fast_path_taken {
                         patch_commits.insert(*index, msg_id.clone());
-                    } else if let Ok(sha) = get_commit_hash(&worktree.path, "HEAD").await {
-                        patch_commits.insert(*index, sha);
+                    } else {
+                        match get_commit_hash(&worktree.path, "HEAD").await {
+                            Ok(sha) => {
+                                patch_commits.insert(*index, sha);
+                            }
+                            Err(e) => {
+                                let msg = format!(
+                                    "Failed to resolve commit hash after applying patch {}/{}: {}\n",
+                                    patchset_id, index, e
+                                );
+                                apply_logs.push_str(&msg);
+                                application_failed = true;
+                                break;
+                            }
+                        }
                     }
                 } else {
                     let msg = format!(
@@ -1991,9 +2004,19 @@ async fn run_review_tool(
     }
     drop(stdin_writer);
 
-    let _ = child.wait().await; // Reap zombie
+    let exit_status = match interaction_result {
+        Ok(json) => {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            Ok(json)
+        }
+        Err(e) => {
+            let _ = child.kill().await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), child.wait()).await;
+            Err(e)
+        }
+    };
 
-    match interaction_result {
+    match exit_status {
         Ok(json) => {
             // Update DB with patch statuses if final_result available
             if let Some(patches) = json["patches"].as_array() {
@@ -3327,4 +3350,89 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_run_review_tool_deadlock_on_timeout() -> Result<()> {
+        let mock_script = r#"#!/bin/bash
+read -r input
+# Block indefinitely by sleeping
+sleep 100
+"#;
+
+        let temp_dir = tempdir()?;
+        let bin_path = temp_dir.path().join("mock_review");
+
+        std::fs::write(&bin_path, mock_script)?;
+        std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+
+        let mut settings = Settings::new()?;
+        settings.database.url = ":memory:".to_string();
+        settings.review.review_tool_override = Some(bin_path);
+        // Set a 1-second timeout
+        settings.review.timeout_seconds = 1;
+
+        let db = Arc::new(Database::new(&settings.database).await?);
+        db.migrate().await?;
+        let quota_manager = Arc::new(QuotaManager::new());
+
+        let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+        db.create_message(
+            "msg_id_p1",
+            thread_id,
+            None,
+            "Author",
+            "Subject",
+            1000,
+            "Body",
+            "",
+            "",
+            None,
+            None,
+        )
+        .await?;
+        let ps_id = db
+            .create_patchset(
+                thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                None, false, None, None,
+            )
+            .await?
+            .expect("Failed to create patchset");
+        let p_id = db
+            .create_patch(ps_id, "msg_id_p1", 1, "diff --git a/foo.c b/foo.c\n+int x;")
+            .await?;
+        let review_id = db
+            .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+            .await?;
+
+        // The 3-second wrapper timeout will trigger if run_review_tool deadlocks on child.wait().
+        let payload = json!({});
+        let review_future = run_review_tool(
+            ps_id,
+            &payload,
+            &settings,
+            db,
+            "HEAD",
+            Some(1),
+            None,
+            quota_manager,
+            review_id,
+            None,
+            Arc::new(MockProvider),
+            Arc::new(Semaphore::new(56)),
+        );
+
+        let timeout_res = tokio::time::timeout(std::time::Duration::from_secs(3), review_future).await;
+        
+        // Assert that the call did NOT hang beyond the 3-second wrapper
+        assert!(timeout_res.is_ok(), "run_review_tool deadlocked and timed out overall");
+        
+        let result = timeout_res.unwrap();
+        // Since it timed out, it should return a timeout error
+        assert!(result.is_err());
+        let err_msg = result.err().unwrap().to_string();
+        assert!(err_msg.contains("timed out") || err_msg.contains("time exceeded"), "Unexpected error: {}", err_msg);
+
+        Ok(())
+    }
 }
+
