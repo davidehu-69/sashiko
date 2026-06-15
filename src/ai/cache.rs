@@ -213,3 +213,78 @@ impl AiProvider for CachingAiProvider {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ai::{AiProvider, AiRequest};
+    use async_trait::async_trait;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct TestProvider {
+        state: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl AiProvider for TestProvider {
+        async fn generate_content(&self, _request: AiRequest) -> Result<AiResponse> {
+            let s = self.state.fetch_add(1, Ordering::SeqCst);
+            if s == 0 {
+                Ok(AiResponse {
+                    content: None,
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            } else {
+                Ok(AiResponse {
+                    content: Some("Valid Response".to_string()),
+                    thought: None,
+                    thought_signature: None,
+                    tool_calls: None,
+                    usage: None,
+                    truncated: false,
+                })
+            }
+        }
+        fn estimate_tokens(&self, _request: &AiRequest) -> usize {
+            0
+        }
+        fn get_capabilities(&self) -> ProviderCapabilities {
+            ProviderCapabilities {
+                model_name: "test-model".to_string(),
+                context_window_size: 1000,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_poisoning_reproducer() -> Result<()> {
+        let test_provider = Arc::new(TestProvider {
+            state: AtomicUsize::new(0),
+        });
+        let cache_provider =
+            CachingAiProvider::new(test_provider, "file:test_cache?mode=memory&cache=shared", 7)
+                .await?;
+
+        let req = AiRequest {
+            system: None,
+            messages: vec![],
+            tools: None,
+            temperature: None,
+            response_format: None,
+            context_tag: None,
+        };
+
+        let resp1 = cache_provider.generate_content(req.clone()).await?;
+        assert!(resp1.content.is_none());
+
+        let resp2 = cache_provider.generate_content(req).await?;
+        assert_eq!(resp2.content.as_deref(), Some("Valid Response"));
+
+        Ok(())
+    }
+}
