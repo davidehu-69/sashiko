@@ -3327,4 +3327,93 @@ inline review content 3\n\n-- \nSashiko AI review · https://sashiko.dev/#/patch
 
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_run_review_tool_timeout_deadlock() -> Result<()> {
+        let mock_script = r#"#!/bin/bash
+sleep 10
+"#;
+        let test_future = async {
+            let temp_dir = tempdir()?;
+            let bin_path = temp_dir.path().join("mock_review");
+
+            std::fs::write(&bin_path, mock_script)?;
+            std::fs::set_permissions(&bin_path, Permissions::from_mode(0o755))?;
+
+            let mut settings = Settings::new()?;
+            settings.database.url = ":memory:".to_string();
+            settings.review.review_tool_override = Some(bin_path);
+            settings.review.timeout_seconds = 1;
+
+            let db = Arc::new(Database::new(&settings.database).await?);
+            db.migrate().await?;
+            let quota_manager = Arc::new(QuotaManager::new());
+
+            let thread_id = db.create_thread("msg_id_1", "Subject", 1000).await?;
+            db.create_message(
+                "msg_id_p1",
+                thread_id,
+                None,
+                "Author",
+                "Subject",
+                1000,
+                "Body",
+                "",
+                "",
+                None,
+                None,
+            )
+            .await?;
+            let ps_id = db
+                .create_patchset(
+                    thread_id, None, "msg_id_1", "Subject", "Author", 1000, 1, 1, "", "", None, 1,
+                    None, false, None, None,
+                )
+                .await?
+                .expect("Failed to create patchset");
+            let p_id = db
+                .create_patch(ps_id, "msg_id_p1", 1, "diff --git a/foo.c b/foo.c\n+int x;")
+                .await?;
+            let review_id = db
+                .create_review(ps_id, Some(p_id), "mock", "mock", None, None)
+                .await?;
+
+            run_review_tool(
+                ps_id,
+                &json!({}),
+                &settings,
+                db,
+                "HEAD",
+                Some(1),
+                None,
+                quota_manager,
+                review_id,
+                None,
+                Arc::new(MockProvider),
+                Arc::new(tokio::sync::Semaphore::new(1)),
+            )
+            .await
+        };
+
+        let test_result = tokio::time::timeout(std::time::Duration::from_secs(3), test_future).await;
+
+        match test_result {
+            Ok(result) => {
+                assert!(result.is_err());
+                let err_msg = result.err().unwrap().to_string();
+                assert!(
+                    err_msg.contains("timeout")
+                        || err_msg.contains("deadline")
+                        || err_msg.contains("channel closed")
+                        || err_msg.contains("broken pipe")
+                );
+            }
+            Err(_) => {
+                panic!(
+                    "TEST FAILED: test_run_review_tool_timeout_deadlock hung and timed out after 3 seconds (deadlock detected!)"
+                );
+            }
+        }
+        Ok(())
+    }
 }
