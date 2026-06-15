@@ -3416,4 +3416,106 @@ sleep 10
         }
         Ok(())
     }
+
+    #[tokio::test]
+    async fn test_concurrent_worktree_corruption_race() -> Result<()> {
+        let dir = tempdir()?;
+        let repo_path = dir.path().to_path_buf();
+
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["init"])
+            .output()
+            .await?;
+        let _ = Command::new("git")
+            .current_dir(&repo_path)
+            .args(["branch", "-m", "master"])
+            .output()
+            .await;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "user.email", "t@example.com"])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["config", "user.name", "Test"])
+            .output()
+            .await?;
+
+        let file_a = repo_path.join("a.txt");
+        std::fs::write(&file_a, "Initial A")?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["commit", "-m", "Commit A"])
+            .output()
+            .await?;
+        let sha_a = get_commit_hash(&repo_path, "HEAD").await?;
+
+        let file_b = repo_path.join("b.txt");
+        std::fs::write(&file_b, "Initial B")?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["add", "."])
+            .output()
+            .await?;
+        Command::new("git")
+            .current_dir(&repo_path)
+            .args(["commit", "-m", "Commit B"])
+            .output()
+            .await?;
+        let sha_b = get_commit_hash(&repo_path, "HEAD").await?;
+
+        let worktree = GitWorktree::new(&repo_path, &sha_a, None).await?;
+        let worktree_path = Arc::new(worktree.path.clone());
+
+        let wt_path1 = worktree_path.clone();
+        let repo_path_clone = repo_path.clone();
+        let sha_a_clone = sha_a.clone();
+        let task1 = tokio::spawn(async move {
+            let wt = GitWorktree::from_path(wt_path1.as_path().to_path_buf(), repo_path_clone);
+            let mut errors = 0;
+            for _ in 0..15 {
+                if wt.reset_hard(&sha_a_clone).await.is_err() {
+                    errors += 1;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            errors
+        });
+
+        let wt_path2 = worktree_path.clone();
+        let repo_path_clone2 = repo_path.clone();
+        let sha_b_clone = sha_b.clone();
+        let task2 = tokio::spawn(async move {
+            let wt = GitWorktree::from_path(wt_path2.as_path().to_path_buf(), repo_path_clone2);
+            let mut errors = 0;
+            for _ in 0..15 {
+                if wt.reset_hard(&sha_b_clone).await.is_err() {
+                    errors += 1;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            errors
+        });
+
+        let (res1, res2) = tokio::join!(task1, task2);
+        let errs1 = res1.unwrap();
+        let errs2 = res2.unwrap();
+
+        let total_errors = errs1 + errs2;
+        if total_errors > 0 {
+            panic!(
+                "TEST FAILED: Concurrent worktree checkouts collided with {} errors!",
+                total_errors
+            );
+        }
+
+        Ok(())
+    }
 }
