@@ -244,11 +244,10 @@ impl ToolBox {
                         obj.insert("end_line".to_string(), Value::Null);
                     }
                 }
-                "git_diff" => {
-                    if !obj.contains_key("paths") {
-                        obj.insert("paths".to_string(), Value::Null);
-                    }
+                "git_diff" if !obj.contains_key("paths") => {
+                    obj.insert("paths".to_string(), Value::Null);
                 }
+                "git_diff" => {}
                 "git_show" => {
                     if !obj.contains_key("suppress_diff") {
                         obj.insert("suppress_diff".to_string(), json!(false));
@@ -266,11 +265,10 @@ impl ToolBox {
                         obj.insert("mode".to_string(), json!("raw"));
                     }
                 }
-                "git_log" => {
-                    if !obj.contains_key("limit") {
-                        obj.insert("limit".to_string(), json!(10));
-                    }
+                "git_log" if !obj.contains_key("limit") => {
+                    obj.insert("limit".to_string(), json!(10));
                 }
+                "git_log" => {}
                 "git_grep" => {
                     if !obj.contains_key("path") {
                         obj.insert("path".to_string(), Value::Null);
@@ -285,11 +283,10 @@ impl ToolBox {
                         obj.insert("is_literal".to_string(), json!(false));
                     }
                 }
-                "git_find_files" => {
-                    if !obj.contains_key("path") {
-                        obj.insert("path".to_string(), Value::Null);
-                    }
+                "git_find_files" if !obj.contains_key("path") => {
+                    obj.insert("path".to_string(), Value::Null);
                 }
+                "git_find_files" => {}
                 _ => {}
             }
         }

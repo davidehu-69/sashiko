@@ -129,8 +129,8 @@ impl AiProvider for CachingAiProvider {
             let tokens_saved: i64 = row.get(1)?;
             let created_at: i64 = row.get(2)?;
             if let Ok(mut resp) = serde_json::from_str::<AiResponse>(&response_json) {
-                let has_content = resp.content.as_ref().map_or(false, |c| !c.trim().is_empty());
-                let has_tool_calls = resp.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty());
+                let has_content = resp.content.as_ref().is_some_and(|c| !c.trim().is_empty());
+                let has_tool_calls = resp.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
 
                 if has_content || has_tool_calls {
                     let (origin, total) = if created_at >= self.session_start {
@@ -181,8 +181,8 @@ impl AiProvider for CachingAiProvider {
 
         let resp = self.inner.generate_content(request.clone()).await?;
 
-        let has_content = resp.content.as_ref().map_or(false, |c| !c.trim().is_empty());
-        let has_tool_calls = resp.tool_calls.as_ref().map_or(false, |tc| !tc.is_empty());
+        let has_content = resp.content.as_ref().is_some_and(|c| !c.trim().is_empty());
+        let has_tool_calls = resp.tool_calls.as_ref().is_some_and(|tc| !tc.is_empty());
 
         if has_content || has_tool_calls {
             let response_json = serde_json::to_string(&resp)?;
